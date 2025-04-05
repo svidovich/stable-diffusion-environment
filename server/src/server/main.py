@@ -1,21 +1,22 @@
 import json
+import os
+from _thread import LockType
 from base64 import b64decode, b64encode
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
-from multiprocessing import Lock
-from loguru import logger
+from json import JSONDecodeError
 from multiprocessing.pool import ThreadPool
-from multiprocessing.synchronize import Lock as LockType
-from os import PathLike
-import os
 from pathlib import Path
+from threading import Lock
 from typing import Any, Self
 from uuid import UUID, uuid4
-from json import JSONDecodeError
 
+import torch
+from diffusers import DiffusionPipeline
 from fastapi import FastAPI, HTTPException, Request
+from loguru import logger
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -26,9 +27,13 @@ from pydantic import (
 from typing_extensions import Annotated
 
 MAX_THREADS = 1
+MODEL_SMALL = "stabilityai/stable-diffusion-2-1-unclip-small"
 
 
 def get_default_disk_flush_directory(ensure_directory: bool = True) -> Path:
+    """
+    Get the default directory where we'll cache generation results on-disk
+    """
     server_directory = Path(__file__).parent
     default_directory = server_directory / "disk_backups"
     if ensure_directory and not default_directory.is_dir():
@@ -37,6 +42,9 @@ def get_default_disk_flush_directory(ensure_directory: bool = True) -> Path:
 
 
 def get_default_disk_flush_filepath(ensure_directory: bool = True) -> Path:
+    """
+    Get a disk flush filepath based on the current time
+    """
     default_directory = get_default_disk_flush_directory(
         ensure_directory=ensure_directory
     )
@@ -45,6 +53,36 @@ def get_default_disk_flush_filepath(ensure_directory: bool = True) -> Path:
         default_directory
         / f"{datetime.now().strftime(date_format)}-sde-server-flush.json"
     )
+
+
+def model_cache_dir(model_name: str, ensure_directory: bool = True) -> Path:
+    """
+    Get the cache dir for the model name.
+    """
+    server_directory = Path(__file__).parent
+    model_cache_directory = server_directory / "model_cache" / model_name
+    if ensure_directory and not model_cache_directory.is_dir():
+        os.makedirs(model_cache_directory, exist_ok=True)
+
+    return model_cache_directory
+
+
+pipeline: DiffusionPipeline | None = None
+
+
+def load_pipeline(model_name: str) -> DiffusionPipeline:
+    """
+    Get a singleton DiffusionPipeline.
+    """
+    global pipeline
+    if not pipeline:
+        pipeline = DiffusionPipeline.from_pretrained(
+            model_name, torch_dtype=torch.float16
+        )
+        assert pipeline, "Couldn't get the pipeline! Ahh!"
+        # looks like typing on this library sucks
+        pipeline.to("cuda")  # type: ignore[attr-defined]
+    return pipeline
 
 
 global_pool: ThreadPool | None = None
@@ -90,6 +128,14 @@ def load_base64(value: Any) -> bytes:
     return b64decode(s=value)
 
 
+def load_datetime_from_isoformat(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("Input should be an ISO formatted date string.")
+    return datetime.fromisoformat(value)
+
+
 class GenerationResult(BaseModel):
     """
     The result of generating an image with stable diffusion.
@@ -98,7 +144,17 @@ class GenerationResult(BaseModel):
     uuid: UUID
     prompt: str
     data: Annotated[bytes, BeforeValidator(load_base64)]
+    created_time: Annotated[datetime, BeforeValidator(load_datetime_from_isoformat)] = (
+        Field(default_factory=datetime.now)
+    )
     errors: list[str] = Field(default_factory=list)
+
+    @field_serializer("created_time")
+    def serialize_created_time(self, created_time: datetime) -> str:
+        """
+        Dump datetime to isoformat for JSON formatting.
+        """
+        return created_time.isoformat()
 
     @field_serializer("uuid")
     def serialize_uuid(self, uuid: UUID) -> str:
@@ -149,20 +205,35 @@ class GenerationOutputs(BaseModel):
         Add a generation result to myself, and return myself.
         """
         # Oh please kill me.
-        with self.lock.acquire():  # type: ignore[attr-defined] # pylint: disable=no-member
+        with self.lock:  # type: ignore[attr-defined] # pylint: disable=no-member
             self.computations[result.uuid] = result
+
         return self
 
-    def flush_to_disk(self, path: PathLike | None = None) -> None:
+    def flush_to_disk(self, path: Path | None = None) -> None:
         """
         Dump the outputs to disk as a JSON array of objects.
         """
-        path = path or get_default_disk_flush_filepath(ensure_directory=True)
-        logger.info(f"Flushing generation outputs to `{path}` ...")
-        results = [entry.model_dump() for entry in self.computations.values()]
-        with open(path, "w") as file_handle:
-            json.dump(results, file_handle)
-        logger.info("Flushed generation outputs.")
+        if self.computations:
+            path = path or get_default_disk_flush_filepath(ensure_directory=True)
+            cache_directory = path.parent
+            extant_cache_files = [
+                cache_directory / cache_file
+                for cache_file in os.listdir(cache_directory)
+            ]
+
+            logger.info(f"Flushing generation outputs to `{path}` ...")
+            results = [entry.model_dump() for entry in self.computations.values()]
+            with open(path, "w") as file_handle:
+                json.dump(results, file_handle)
+            logger.info("Flushed generation outputs.")
+            logger.info("Dropping old cache files ...")
+            # Dropping old cache files can help us consolidate our cache.
+            # Only do this once we've saved the current cache.
+            for extant_cache_file in extant_cache_files:
+                extant_cache_file.unlink()
+        else:
+            logger.info("Would've written computations, but nothing to write!")
 
     @classmethod
     def load_from_disk(cls, cache_directory: Path | None = None) -> Self:
@@ -170,9 +241,12 @@ class GenerationOutputs(BaseModel):
         Attempt to load generation outputs from disk as a JSON array of objects, if I can.
         """
         cache_directory = cache_directory or get_default_disk_flush_directory()
+        logger.info(
+            f"Attempting to load cached generation outputs from `{cache_directory}` ..."
+        )
         loaded_entries: dict[UUID, GenerationResult] = {}
         for dirent in os.listdir(cache_directory):
-            dirent_path = Path(dirent)
+            dirent_path = cache_directory / dirent
             if dirent_path.is_file():
                 logger.info(f"Found potential cache file at `{dirent_path}`.")
                 try:
@@ -180,7 +254,7 @@ class GenerationOutputs(BaseModel):
                         raw = json.load(file_handle)
                     if isinstance(raw, list):
                         logger.info(
-                            f"Attempting to load {len(raw)} from cache file at `{dirent_path}` ..."
+                            f"Attempting to load {len(raw)} entries from cache file at `{dirent_path}` ..."
                         )
                         for candidate in raw:
                             loaded_entry = GenerationResult.model_validate(candidate)
@@ -233,7 +307,11 @@ def prompt_stable_diffusion(uuid: UUID, prompt: str) -> GenerationResult:
     """
     Give the prompt to stable diffusion, bringing back the generated image.
     """
-    return GenerationResult(uuid=uuid, prompt=prompt, data=b"deadbeef", errors=[])
+    logger.info(f"Beginning computation of prompt with ID `{uuid}`.")
+    # pipeline = load_pipeline(model_name=MODEL_SMALL)
+    result = GenerationResult(uuid=uuid, prompt=prompt, data=b"deadbeef", errors=[])
+    logger.info(f"Completed generation for prompt with ID `{uuid}`!")
+    return result
 
 
 def generate_image(
@@ -247,6 +325,7 @@ def generate_image(
     generation_outputs.add_generation_result(
         result=prompt_stable_diffusion(uuid=uuid, prompt=prompt)
     )
+    logger.info(f"Result with UUID `{uuid}` added!")
 
 
 @app.post("/image/generate")
@@ -258,10 +337,10 @@ async def route_generate_image(
     Return the UUID by which this generation request can be referenced.
     If there's not enough compute, tell the caller to go away.
     """
-    if pool_available(pool=request.state.pool):
+    if pool_available(pool=request.state.threadpool):
         generation_uuid = uuid4()
         async_pool_execution(
-            pool=request.state.pool,
+            pool=request.state.threadpool,
             function=generate_image,
             uuid=generation_uuid,
             prompt=post_body.prompt,
@@ -284,8 +363,8 @@ async def route_show_generations(
     """
     results = request.state.outputs
     if generation_uuid:
-        generation_result = results.computations.query_by_uuid(generation_uuid)
+        generation_result = results.query_by_uuid(generation_uuid)
         if generation_result:
             return [generation_result]
         return []
-    return results.computations.to_list()
+    return results.to_list()
