@@ -1,4 +1,5 @@
 import json
+import jsonlines
 import os
 from _thread import LockType
 from base64 import b64decode, b64encode
@@ -129,6 +130,11 @@ def load_base64(value: Any) -> bytes:
 
 
 def load_datetime_from_isoformat(value: Any) -> datetime:
+    """
+    Try to load a datetime from whatever you throw its way. It's expecting an ISO formatted date string.
+    If it's already a datetime, though, it'll hand it back to you.
+    Raises ValueError if you pass it garbage.
+    """
     if isinstance(value, datetime):
         return value
     if not isinstance(value, str):
@@ -224,8 +230,8 @@ class GenerationOutputs(BaseModel):
 
             logger.info(f"Flushing generation outputs to `{path}` ...")
             results = [entry.model_dump() for entry in self.computations.values()]
-            with open(path, "w") as file_handle:
-                json.dump(results, file_handle)
+            with jsonlines.open(path, "w") as writer:
+                writer.write_all(results)
             logger.info("Flushed generation outputs.")
             logger.info("Dropping old cache files ...")
             # Dropping old cache files can help us consolidate our cache.
@@ -250,20 +256,10 @@ class GenerationOutputs(BaseModel):
             if dirent_path.is_file():
                 logger.info(f"Found potential cache file at `{dirent_path}`.")
                 try:
-                    with open(dirent_path, "r") as file_handle:
-                        raw = json.load(file_handle)
-                    if isinstance(raw, list):
-                        logger.info(
-                            f"Attempting to load {len(raw)} entries from cache file at `{dirent_path}` ..."
-                        )
-                        for candidate in raw:
-                            loaded_entry = GenerationResult.model_validate(candidate)
+                    with jsonlines.open(dirent_path, "r") as reader:
+                        for entry in reader.iter(type=dict, skip_invalid=True):
+                            loaded_entry = GenerationResult.model_validate(entry)
                             loaded_entries[loaded_entry.uuid] = loaded_entry
-                    else:
-                        logger.info(
-                            f"Malformed cache file at `{dirent_path}`. Skipping ahead."
-                        )
-                        continue
                 except (JSONDecodeError, ValidationError) as exc:
                     logger.error(
                         f"Failed to load cache file at `{dirent_path}`: {exc}. Skipping ahead."
@@ -274,7 +270,10 @@ class GenerationOutputs(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    A lifespan for the app, accessible through request.state.
+    A lifespan for the app, accessible through request.state. With it, you get...
+    - request.state.pool: ThreadPool - one-man-army ThreadPool for generating images
+    - request.state.outputs: GenerationOutputs - the shared object for storing the results
+      of image generation
     """
     pool = get_pool()
     # TODO make this ... non-mandatory
@@ -326,6 +325,24 @@ def generate_image(
         result=prompt_stable_diffusion(uuid=uuid, prompt=prompt)
     )
     logger.info(f"Result with UUID `{uuid}` added!")
+
+
+class PoolAvailableResponse(BaseModel):
+    """
+    Is the server ready to generate images?
+    """
+
+    is_available: bool
+
+
+@app.get("/server/status")
+async def route_pool_available(request: Request) -> PoolAvailableResponse:
+    """
+    Determine whether the server is ready to generate images or not.
+    """
+    return PoolAvailableResponse(
+        is_available=pool_available(pool=request.state.threadpool)
+    )
 
 
 @app.post("/image/generate")
