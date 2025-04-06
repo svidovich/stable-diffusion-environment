@@ -346,7 +346,9 @@ class GenerationOutputs(BaseModel):
         # Oh please kill me.
         with self.lock:  # type: ignore[attr-defined] # pylint: disable=no-member
             self.computations[result.uuid] = result
-        self.flush_to_disk()
+            # Disk flush might take a while, so let's lock that too, which effectively
+            # locks the cache file.
+            self.flush_to_disk()
         return self
 
     def flush_to_disk(self, path: Path | None = None) -> None:
