@@ -1,5 +1,4 @@
 import json
-import jsonlines
 import os
 from _thread import LockType
 from base64 import b64decode, b64encode
@@ -14,10 +13,12 @@ from threading import Lock
 from typing import Any, Self
 from uuid import UUID, uuid4
 
+import jsonlines
 import torch
 from diffusers import DiffusionPipeline
 from fastapi import FastAPI, HTTPException, Request
 from loguru import logger
+from PIL.Image import Image
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -78,7 +79,9 @@ def load_pipeline(model_name: str) -> DiffusionPipeline:
     global pipeline
     if not pipeline:
         pipeline = DiffusionPipeline.from_pretrained(
-            model_name, torch_dtype=torch.float16
+            model_name,
+            cache_dir=model_cache_dir(model_name=model_name),
+            torch_dtype=torch.float16,
         )
         assert pipeline, "Couldn't get the pipeline! Ahh!"
         # looks like typing on this library sucks
@@ -116,12 +119,14 @@ def async_pool_execution(pool: ThreadPool, function: Callable, **kwargs) -> None
     pool.apply_async(func=function, kwds={**kwargs})
 
 
-def load_base64(value: Any) -> bytes:
+def load_base64(value: Any) -> bytes | None:
     """
     Try to load base64 from whatever you throw its way. If it's already bytes, just gives back bytes.
     Raises ValueError if it's not bytes or a string.
     Raises something interesting if it's an invalid base64 string.
     """
+    if value is None:
+        return value
     if isinstance(value, bytes):
         return value
     if not isinstance(value, str):
@@ -149,11 +154,17 @@ class GenerationResult(BaseModel):
 
     uuid: UUID
     prompt: str
-    data: Annotated[bytes, BeforeValidator(load_base64)]
+    data: Annotated[bytes | None, BeforeValidator(load_base64)]
     created_time: Annotated[datetime, BeforeValidator(load_datetime_from_isoformat)] = (
         Field(default_factory=datetime.now)
     )
     errors: list[str] = Field(default_factory=list)
+
+    def add_error(self, error: str) -> None:
+        """
+        Add an error to the list of errors.
+        """
+        self.errors.append(error)
 
     @field_serializer("created_time")
     def serialize_created_time(self, created_time: datetime) -> str:
@@ -170,11 +181,13 @@ class GenerationResult(BaseModel):
         return str(uuid)
 
     @field_serializer("data")
-    def serialize_data(self, data: bytes) -> str:
+    def serialize_data(self, data: bytes | None) -> str | None:
         """
         Dump bytes to base64 for JSON formatting.
         """
-        return b64encode(data).decode("utf-8")
+        if data is not None:
+            return b64encode(data).decode("utf-8")
+        return None
 
 
 class GenerationOutputs(BaseModel):
@@ -307,9 +320,22 @@ def prompt_stable_diffusion(uuid: UUID, prompt: str) -> GenerationResult:
     Give the prompt to stable diffusion, bringing back the generated image.
     """
     logger.info(f"Beginning computation of prompt with ID `{uuid}`.")
-    # pipeline = load_pipeline(model_name=MODEL_SMALL)
-    result = GenerationResult(uuid=uuid, prompt=prompt, data=b"deadbeef", errors=[])
-    logger.info(f"Completed generation for prompt with ID `{uuid}`!")
+    result = GenerationResult(uuid=uuid, prompt=prompt, data=None, errors=[])
+    try:
+        pipeline = load_pipeline(model_name=MODEL_SMALL)
+        # According to the comments in pipeline_utils.py from diffusers.pipelines,
+        # here images is a List[PIL.Image.Image]. Then, ideally generated_image results as an
+        # image from PIL, and we can just convert it to bytes.
+        # Mypy thinks it's not callable. But, the resultant DiffusionPipeline from load_pipeline
+        # _should_ be ... maybe.
+        generated_image: Image = pipeline(prompt).images[0]  # type: ignore[operator]
+        result.data = generated_image.tobytes()
+        logger.info(f"Completed generation for prompt with ID `{uuid}`!")
+    except Exception as exc:
+        logger.exception(
+            "Something awful happened when attempting to prompt and get an image back!"
+        )
+        result.add_error(str(exc))
     return result
 
 
