@@ -52,7 +52,7 @@ Indeed, the default port for the server is `9090`.
 
 ### Server Details and Endpoints
 
-\*\*NOTE: Currently this thing only uses "stabilityai/stable-diffusion-2-1". This was just for testing. We'll use different models going forward."
+**NOTE: Currently this thing only uses "`stabilityai/stable-diffusion-2-1`". This was just for testing. We'll use different models going forward.**
 
 The server runs on a FastAPI backed by a single-worker `ThreadPool`. You can generate one image at a time, and then poll for the results while you wait. If the pool isn't available for generation, you'll get a 'too many requests' back from the generation endpoint.
 
