@@ -31,6 +31,7 @@ import jsonlines
 import torch
 from diffusers import DiffusionPipeline
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from PIL.Image import Image
 from pydantic import (
@@ -91,16 +92,9 @@ GENERATION_DEFAULTS_LIST = [
     GenerationOptions(
         size=MachineSize.LITTLE,
         enable_attention_slicing=True,
-        enable_sequential_cpu_offload=False,
-        image_height=384,
-        image_width=384,
-    ),
-    GenerationOptions(
-        size=MachineSize.BABY,
-        enable_attention_slicing=True,
         enable_sequential_cpu_offload=True,
-        image_height=256,
-        image_width=256,
+        image_height=512,
+        image_width=512,
     ),
 ]
 
@@ -421,12 +415,26 @@ async def lifespan(app_: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+# NOTE such permissive CORS is dangerous. But, this is a fun app.
+# So, let's not take it _too_ seriously, right?
+origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 class ImageGenerationBody(BaseModel):
     """
     The shape of a POST body for generating images.
     """
 
     prompt: str
+    dry_run: bool = False
 
 
 class ImageGenerationResponse(BaseModel):
@@ -438,13 +446,17 @@ class ImageGenerationResponse(BaseModel):
 
 
 def prompt_stable_diffusion(
-    uuid: UUID, prompt: str, options: GenerationOptions
+    uuid: UUID, prompt: str, options: GenerationOptions, dry_run: bool = False
 ) -> GenerationResult:
     """
     Give the prompt to stable diffusion, bringing back the generated image.
+    If dry run is true, we'll just pass 0xdeadbeef back without running the pipeline.
     """
     logger.info(f"Beginning computation of prompt with ID `{uuid}`.")
     result = GenerationResult(uuid=uuid, prompt=prompt, data=None, errors=[])
+    if dry_run:
+        result.data = b"deadbeef"
+        return result
     try:
         sd_pipeline = load_pipeline(model_name=MODEL_SMALL, options=options)
         # According to the comments in pipeline_utils.py from diffusers.pipelines,
@@ -471,7 +483,10 @@ def prompt_stable_diffusion(
 
 
 def generate_image(
-    uuid: UUID, prompt: str, generation_outputs: GenerationOutputs
+    uuid: UUID,
+    prompt: str,
+    generation_outputs: GenerationOutputs,
+    dry_run: bool = False,
 ) -> None:
     """
     Generate an image with the given prompt. Add it to the given
@@ -480,7 +495,9 @@ def generate_image(
     logger.info(f"Received a prompt! `{prompt}`")
     options = generation_options_from_environment()
     generation_outputs.add_generation_result(
-        result=prompt_stable_diffusion(uuid=uuid, prompt=prompt, options=options)
+        result=prompt_stable_diffusion(
+            uuid=uuid, prompt=prompt, options=options, dry_run=dry_run
+        )
     )
     logger.info(f"Result with UUID `{uuid}` added!")
 
@@ -520,6 +537,7 @@ async def route_generate_image(
             uuid=generation_uuid,
             prompt=post_body.prompt,
             generation_outputs=request.state.outputs,
+            dry_run=post_body.dry_run,
         )
         return ImageGenerationResponse(generation_uuid=str(generation_uuid))
     raise HTTPException(
@@ -543,3 +561,12 @@ async def route_show_generations(
             return [generation_result]
         return []
     return results.to_list()
+
+
+@app.get("/")
+@app.get("/health")
+async def health_check() -> dict:
+    """
+    Very light health check for the server.
+    """
+    return {"status": "OK"}
